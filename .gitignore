@@ -1,0 +1,12 @@
+# ESPHome build artifacts
+/.esphome/
+/secrets.yaml
+
+# Editor / tooling
+.vscode/
+.idea/
+**/__pycache__/
+*.pyc
+
+# Local Claude Code state
+/.claude/

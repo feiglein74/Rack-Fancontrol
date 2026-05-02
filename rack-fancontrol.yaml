@@ -1,0 +1,439 @@
+esphome:
+  name: rack-fancontrol
+  friendly_name: Rack Fan Control
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    # Moderate baseline speed until the first SNMP reading arrives and the
+    # PID takes over. 100% at boot cools the MikroTik too hard and causes
+    # overshoot once climate.mode=COOL kicks in.
+    - priority: -100
+      then:
+        - fan.turn_on:
+            id: fan1
+            speed: 50
+        - fan.turn_on:
+            id: fan2
+            speed: 50
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+
+api:
+
+ota:
+  - platform: esphome
+
+web_server:
+  version: 3
+  port: 80
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  frequency: 100kHz
+
+debug:
+  update_interval: 10s
+
+globals:
+  - id: fan1_deadzone_pwm
+    type: float
+    restore_value: true
+    initial_value: '55.0'
+  - id: fan1_max_rpm
+    type: float
+    restore_value: true
+    initial_value: '2000.0'
+  - id: calib_samples
+    type: "float[6]"
+    restore_value: false
+    initial_value: '{0, 0, 0, 0, 0, 0}'
+  - id: calib_min_rpm
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: auto_cool_started
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+button:
+  - platform: template
+    name: "Fan 1 kalibrieren"
+    id: btn_calibrate_fan1
+    on_press:
+      then:
+        - script.execute: calibrate_fan1
+
+script:
+  - id: calibrate_fan1
+    mode: restart
+    then:
+      - logger.log: "=== Fan 1 Kalibrierung: START ==="
+      - climate.control:
+          id: rack_cooling
+          mode: "OFF"
+      - delay: 500ms
+      # Baseline: PWM 0% -> fan idles at its natural minimum
+      - fan.turn_off: fan1
+      - delay: 8s
+      - lambda: "id(calib_min_rpm) = id(fan1_tach).state;"
+      - logger.log:
+          format: "Min RPM (PWM off): %.0f"
+          args: ["id(calib_min_rpm)"]
+      # 6 Messpunkte: 25 / 40 / 55 / 70 / 85 / 100 % PWM, je ~6 s einschwingen
+      - fan.turn_on: {id: fan1, speed: 25}
+      - delay: 6s
+      - lambda: "id(calib_samples)[0] = id(fan1_tach).state;"
+      - fan.turn_on: {id: fan1, speed: 40}
+      - delay: 6s
+      - lambda: "id(calib_samples)[1] = id(fan1_tach).state;"
+      - fan.turn_on: {id: fan1, speed: 55}
+      - delay: 6s
+      - lambda: "id(calib_samples)[2] = id(fan1_tach).state;"
+      - fan.turn_on: {id: fan1, speed: 70}
+      - delay: 6s
+      - lambda: "id(calib_samples)[3] = id(fan1_tach).state;"
+      - fan.turn_on: {id: fan1, speed: 85}
+      - delay: 6s
+      - lambda: "id(calib_samples)[4] = id(fan1_tach).state;"
+      - fan.turn_on: {id: fan1, speed: 100}
+      - delay: 6s
+      - lambda: "id(calib_samples)[5] = id(fan1_tach).state;"
+      - lambda: |-
+          const int duties[6] = {25, 40, 55, 70, 85, 100};
+          const float margin = 150.0f;  // RPM must exceed min+margin to count as "scaling"
+          int idx = -1;
+          for (int i = 0; i < 6; i++) {
+            ESP_LOGI("calib", "  duty=%d%%  rpm=%.0f", duties[i], id(calib_samples)[i]);
+            if (idx < 0 && id(calib_samples)[i] > id(calib_min_rpm) + margin) {
+              idx = i;
+            }
+          }
+          if (idx > 0) {
+            // Interpolate between the last "still min" point and the first "scaling" point
+            float d_low = (float) duties[idx - 1];
+            float d_high = (float) duties[idx];
+            float r_low = id(calib_samples)[idx - 1];
+            float r_high = id(calib_samples)[idx];
+            float target = id(calib_min_rpm) + margin;
+            id(fan1_deadzone_pwm) = d_low + (target - r_low) * (d_high - d_low) / (r_high - r_low);
+          } else if (idx == 0) {
+            id(fan1_deadzone_pwm) = (float) duties[0];
+          } else {
+            // fan never scaled (broken?)  keep previous value
+            ESP_LOGW("calib", "Fan did not exceed minimum at any tested duty; keeping previous threshold");
+          }
+          id(fan1_max_rpm) = id(calib_samples)[5];
+          ESP_LOGI("calib", "=== RESULT: deadzone_pwm=%.1f%%  max_rpm=%.0f ===",
+                   id(fan1_deadzone_pwm), id(fan1_max_rpm));
+      - fan.turn_off: fan1
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+
+  - platform: template
+    name: "Uptime lesbar"
+    id: uptime_human
+    icon: "mdi:clock-start"
+    update_interval: 10s
+    lambda: |-
+      uint32_t s = (uint32_t) id(uptime_sensor).state;
+      uint32_t d = s / 86400; s %= 86400;
+      uint32_t h = s / 3600;  s %= 3600;
+      uint32_t m = s / 60;    s %= 60;
+      char buf[32];
+      if (d > 0)
+        snprintf(buf, sizeof(buf), "%ud %02uh %02um %02us", d, h, m, s);
+      else if (h > 0)
+        snprintf(buf, sizeof(buf), "%uh %02um %02us", h, m, s);
+      else if (m > 0)
+        snprintf(buf, sizeof(buf), "%um %02us", m, s);
+      else
+        snprintf(buf, sizeof(buf), "%us", s);
+      return std::string(buf);
+
+  - platform: template
+    name: "Fan 1 Drehzahl"
+    id: fan1_rpm_human
+    icon: "mdi:fan"
+    # Wird ausschließlich aus fan1_tach.on_value gespeist (siehe sensor-Block),
+    # damit die gleiche Hysterese gilt wie auf der numerischen Drehzahl.
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+
+  - platform: snmp_sensor
+    name: "MikroTik CPU Temp"
+    id: mikrotik_cpu_temp
+    host: 10.0.0.65
+    community: public
+    oid: "1.3.6.1.4.1.14988.1.1.3.11.0"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    device_class: temperature
+    state_class: measurement
+    update_interval: 60s
+    filters:
+      - multiply: 0.1
+      - exponential_moving_average:
+          alpha: 0.4
+          send_every: 1
+    # First valid SNMP sample after boot auto-switches the PID on so it
+    # starts with real data instead of an overshoot-inducing 100% blast.
+    # One-shot via auto_cool_started flag (non-persistent) so the user
+    # can later switch climate to OFF manually without being re-armed.
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return !id(auto_cool_started) && id(rack_cooling).mode == climate::CLIMATE_MODE_OFF;"
+            then:
+              - climate.control:
+                  id: rack_cooling
+                  mode: COOL
+              - lambda: "id(auto_cool_started) = true;"
+
+  # SFP+ module temperatures via RouterOS DDM (mtxrOptical)
+  # .14988.1.1.19.1.1.6.<if_index>; interface indices observed on CRS305:
+  #   3 = sfp-sfpplus1, 4 = sfp-sfpplus2, 6 = sfp-sfpplus4-uplink
+  - platform: snmp_sensor
+    name: "SFP+ sfpplus1 Temp"
+    id: sfp1_temp
+    host: 10.0.0.65
+    community: public
+    oid: "1.3.6.1.4.1.14988.1.1.19.1.1.6.3"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    update_interval: 60s
+    filters:
+      - exponential_moving_average:
+          alpha: 0.4
+          send_every: 1
+
+  - platform: snmp_sensor
+    name: "SFP+ sfpplus2 Temp"
+    id: sfp2_temp
+    host: 10.0.0.65
+    community: public
+    oid: "1.3.6.1.4.1.14988.1.1.19.1.1.6.4"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    update_interval: 60s
+    filters:
+      - exponential_moving_average:
+          alpha: 0.4
+          send_every: 1
+
+  - platform: snmp_sensor
+    name: "SFP+ sfpplus4 Temp"
+    id: sfp4_temp
+    host: 10.0.0.65
+    community: public
+    oid: "1.3.6.1.4.1.14988.1.1.19.1.1.6.6"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    update_interval: 60s
+    filters:
+      - exponential_moving_average:
+          alpha: 0.4
+          send_every: 1
+
+  # Max of CPU + all SFP+ module temperatures. PID regulates against this
+  # so whichever component is hottest gets protection. NaN inputs (unplugged
+  # modules, not-yet-polled) are skipped.
+  - platform: template
+    name: "Rack Max Temp"
+    id: rack_max_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    update_interval: 15s
+    lambda: |-
+      // sfp4 (uplink) excluded -- its DDM reading was unstable/jumpy, poor
+      // PID input. Still exposed as a separate sensor for observation.
+      float vals[] = {
+        id(mikrotik_cpu_temp).state,
+        id(sfp1_temp).state,
+        id(sfp2_temp).state,
+      };
+      float m = -1000.0f;
+      for (float v : vals) {
+        if (!isnan(v) && v > m) m = v;
+      }
+      if (m < -900.0f) return NAN;
+      return m;
+
+  - platform: ina219
+    address: 0x40
+    shunt_resistance: 0.1 ohm
+    max_voltage: 32.0V
+    max_current: 3.2A
+    update_interval: 1s
+    bus_voltage:
+      name: "Bus Spannung"
+      accuracy_decimals: 3
+    shunt_voltage:
+      name: "Shunt Spannung"
+      accuracy_decimals: 5
+    current:
+      name: "Strom"
+      id: strom_a
+      accuracy_decimals: 4
+    power:
+      name: "Leistung"
+      accuracy_decimals: 3
+
+  - platform: pulse_counter
+    pin:
+      number: GPIO5
+      mode:
+        input: true
+        pullup: true
+    id: fan1_tach
+    name: "Fan 1 RPM"
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    update_interval: 2s
+    filters:
+      - multiply: 0.5
+      # Hysterese: nur publishen wenn sich die Drehzahl wirklich ändert.
+      # delta:50 fängt Mess-Jitter ab, throttle:60s ist der Heartbeat
+      # damit HA-History/Logbuch nicht "stale" wird.
+      - or:
+          - delta: 50
+          - throttle: 60s
+    on_value:
+      then:
+        - text_sensor.template.publish:
+            id: fan1_rpm_human
+            state: !lambda |-
+              if (isnan(x)) return std::string("–");
+              int rpm = (int) (x + 0.5f);
+              char buf[16];
+              if (rpm >= 1000)
+                snprintf(buf, sizeof(buf), "%d.%03d RPM", rpm / 1000, rpm % 1000);
+              else
+                snprintf(buf, sizeof(buf), "%d RPM", rpm);
+              return std::string(buf);
+
+output:
+  - platform: ledc
+    id: fan1_pwm_out
+    pin: GPIO4
+    frequency: 25000Hz
+    channel: 0            # Timer 0 (channels 0-1 share timer 0 on ESP32-S3)
+  - platform: ledc
+    id: fan2_pwm_out
+    pin: GPIO6
+    frequency: 100Hz
+    channel: 2            # Timer 1 (channels 2-3 share timer 1); avoids clash with Fan 1's 25 kHz
+
+  - platform: template
+    id: fan_group_output
+    type: float
+    write_action:
+      # When climate.mode = OFF, leave the fans alone so the user can
+      # control them manually via the slider without PID overwriting.
+      - if:
+          condition:
+            lambda: "return id(rack_cooling).mode == climate::CLIMATE_MODE_OFF;"
+          then: []
+          else:
+            - if:
+                condition:
+                  lambda: "return state <= 0.01f;"
+                then:
+                  - fan.turn_off: fan1
+                  - fan.turn_off: fan2
+                else:
+                  # Staged cooling: Fan 1 across PID 0..0.5 mapped onto PWM range
+                  # [deadzone..100] -- skips the fan's dead zone where duty changes
+                  # don't move the rotor. fan1_deadzone_pwm is set empirically by
+                  # the "Fan 1 kalibrieren" button (defaults to 55 before first run).
+                  # Fan 2 (2-pin via MOSFET) ramps 0..100% across PID 0.5..1.0.
+                  - fan.turn_on:
+                      id: fan1
+                      speed: !lambda |-
+                        float dz = id(fan1_deadzone_pwm);
+                        float s = dz + state * 2.0f * (100.0f - dz);
+                        if (s > 100.0f) s = 100.0f;
+                        return (int)(s + 0.5f);
+                  - if:
+                      condition:
+                        lambda: "return state <= 0.5f;"
+                      then:
+                        - fan.turn_off: fan2
+                      else:
+                        - fan.turn_on:
+                            id: fan2
+                            speed: !lambda |-
+                              float s = (state - 0.5f) * 200.0f;
+                              if (s > 100.0f) s = 100.0f;
+                              return (int)(s + 0.5f);
+
+fan:
+  - platform: speed
+    id: fan1
+    name: "Fan 1 (4-pin)"
+    output: fan1_pwm_out
+  - platform: speed
+    id: fan2
+    name: "Fan 2 (2-pin, MOSFET)"
+    output: fan2_pwm_out
+
+climate:
+  - platform: pid
+    name: "Rack Cooling"
+    id: rack_cooling
+    sensor: rack_max_temp
+    default_target_temperature: 45°C
+    cool_output: fan_group_output
+    control_parameters:
+      kp: 0.02
+      ki: 0.0005
+      kd: 10.0
+      output_averaging_samples: 6
+      derivative_averaging_samples: 12
+      min_integral: -0.3
+      max_integral: 0.3
+    deadband_parameters:
+      threshold_high: 1.5
+      threshold_low: -1.5
+      kp_multiplier: 0.0
+      ki_multiplier: 0.0
+      kd_multiplier: 0.0
+      deadband_output_averaging_samples: 1
+    visual:
+      min_temperature: 30°C
+      max_temperature: 70°C
+      temperature_step: 0.5°C
