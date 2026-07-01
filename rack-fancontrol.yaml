@@ -180,6 +180,47 @@ text_sensor:
     # Wird ausschließlich aus fan1_tach.on_value gespeist (siehe sensor-Block),
     # damit die gleiche Hysterese gilt wie auf der numerischen Drehzahl.
 
+  # Klartext-Regler-Status fürs Dashboard. Der binary_sensor ist für
+  # HA-Automationen da; das hier ist die menschenlesbare Anzeige, damit man
+  # den Notlauf auf einen Blick sieht statt "Temp = NA" deuten zu müssen.
+  - platform: template
+    name: "Kühlung Status"
+    id: cooling_status
+    icon: "mdi:heat-wave"
+    update_interval: 5s
+    lambda: |-
+      if (id(rack_cooling).mode == climate::CLIMATE_MODE_OFF)
+        return std::string("Manuell – Regelung aus");
+      if (isnan(id(rack_max_temp).state))
+        return std::string("STÖRUNG: keine Temp-Daten – Notlauf 50%");
+      return std::string("OK – PID regelt");
+
+text:
+  # Laufzeit-IP für den MikroTik, ohne Reflash. Grund: die CRS305-IP kann sich
+  # (früher DHCP, jetzt Reservierung) verschieben -- vorher hing sie hart in
+  # vier host:-Feldern. restore_value überlebt Reboots; on_value schreibt die
+  # neue IP live in alle SNMP-Sensoren (set_host wird beim nächsten Poll aktiv).
+  # Nur dotted-IPv4 (der Component parst via inet_aton, kein DNS).
+  - platform: template
+    name: "MikroTik IP"
+    id: mikrotik_ip
+    icon: "mdi:ip-network"
+    optimistic: true
+    mode: text
+    restore_value: true
+    initial_value: "10.0.0.65"
+    min_length: 7
+    max_length: 15
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty()) return;
+            id(mikrotik_cpu_temp).set_host(x);
+            id(sfp1_temp).set_host(x);
+            id(sfp2_temp).set_host(x);
+            id(sfp4_temp).set_host(x);
+            ESP_LOGI("mikrotik_ip", "SNMP-Host zur Laufzeit -> %s", x.c_str());
+
 sensor:
   - platform: uptime
     name: "Uptime"
@@ -201,6 +242,14 @@ sensor:
       - exponential_moving_average:
           alpha: 0.4
           send_every: 1
+      # Ehrlichkeit statt Phantomwert: der snmp_sensor publiziert bei
+      # Timeout/Ausfall GAR NICHTS -> der Sensor friert sonst auf dem letzten
+      # Wert ein und der PID regelt auf eine Lüge weiter (bis "0 ist gut").
+      # Nach ~3 verpassten Polls (180s) hier bewusst NaN -> in HA "unavailable",
+      # rack_max_temp überspringt NaN, und der Failsafe unten greift.
+      - timeout:
+          timeout: 180s
+          value: !lambda "return NAN;"
     # First valid SNMP sample after boot auto-switches the PID on so it
     # starts with real data instead of an overshoot-inducing 100% blast.
     # One-shot via auto_cool_started flag (non-persistent) so the user
@@ -234,6 +283,10 @@ sensor:
       - exponential_moving_average:
           alpha: 0.4
           send_every: 1
+      # Speist rack_max_temp -> darf bei SNMP-Ausfall nicht einfrieren.
+      - timeout:
+          timeout: 180s
+          value: !lambda "return NAN;"
 
   - platform: snmp_sensor
     name: "SFP+ sfpplus2 Temp"
@@ -250,6 +303,10 @@ sensor:
       - exponential_moving_average:
           alpha: 0.4
           send_every: 1
+      # Speist rack_max_temp -> darf bei SNMP-Ausfall nicht einfrieren.
+      - timeout:
+          timeout: 180s
+          value: !lambda "return NAN;"
 
   - platform: snmp_sensor
     name: "SFP+ sfpplus4 Temp"
@@ -266,6 +323,10 @@ sensor:
       - exponential_moving_average:
           alpha: 0.4
           send_every: 1
+      # Nur Beobachtung (nicht in rack_max_temp), aber konsistent unavailable.
+      - timeout:
+          timeout: 180s
+          value: !lambda "return NAN;"
 
   # Max of CPU + all SFP+ module temperatures. PID regulates against this
   # so whichever component is hottest gets protection. NaN inputs (unplugged
@@ -369,37 +430,47 @@ output:
             lambda: "return id(rack_cooling).mode == climate::CLIMATE_MODE_OFF;"
           then: []
           else:
+            # Temperaturquelle tot (rack_max_temp NaN)? Dann ist der PID blind.
+            # Nicht auf einen Phantomwert weiterregeln (das war der "0 ist gut"-
+            # Bug) -- der interval-Watchdog unten hält beide Lüfter auf dem
+            # 50%-Failsafe-Boden. Hier nichts tun, damit der PID nicht dagegen
+            # schreibt.
             - if:
                 condition:
-                  lambda: "return state <= 0.01f;"
-                then:
-                  - fan.turn_off: fan1
-                  - fan.turn_off: fan2
+                  lambda: "return isnan(id(rack_max_temp).state);"
+                then: []
                 else:
-                  # Staged cooling: Fan 1 across PID 0..0.5 mapped onto PWM range
-                  # [deadzone..100] -- skips the fan's dead zone where duty changes
-                  # don't move the rotor. fan1_deadzone_pwm is set empirically by
-                  # the "Fan 1 kalibrieren" button (defaults to 55 before first run).
-                  # Fan 2 (2-pin via MOSFET) ramps 0..100% across PID 0.5..1.0.
-                  - fan.turn_on:
-                      id: fan1
-                      speed: !lambda |-
-                        float dz = id(fan1_deadzone_pwm);
-                        float s = dz + state * 2.0f * (100.0f - dz);
-                        if (s > 100.0f) s = 100.0f;
-                        return (int)(s + 0.5f);
                   - if:
                       condition:
-                        lambda: "return state <= 0.5f;"
+                        lambda: "return state <= 0.01f;"
                       then:
+                        - fan.turn_off: fan1
                         - fan.turn_off: fan2
                       else:
+                        # Staged cooling: Fan 1 across PID 0..0.5 mapped onto PWM range
+                        # [deadzone..100] -- skips the fan's dead zone where duty changes
+                        # don't move the rotor. fan1_deadzone_pwm is set empirically by
+                        # the "Fan 1 kalibrieren" button (defaults to 55 before first run).
+                        # Fan 2 (2-pin via MOSFET) ramps 0..100% across PID 0.5..1.0.
                         - fan.turn_on:
-                            id: fan2
+                            id: fan1
                             speed: !lambda |-
-                              float s = (state - 0.5f) * 200.0f;
+                              float dz = id(fan1_deadzone_pwm);
+                              float s = dz + state * 2.0f * (100.0f - dz);
                               if (s > 100.0f) s = 100.0f;
                               return (int)(s + 0.5f);
+                        - if:
+                            condition:
+                              lambda: "return state <= 0.5f;"
+                            then:
+                              - fan.turn_off: fan2
+                            else:
+                              - fan.turn_on:
+                                  id: fan2
+                                  speed: !lambda |-
+                                    float s = (state - 0.5f) * 200.0f;
+                                    if (s > 100.0f) s = 100.0f;
+                                    return (int)(s + 0.5f);
 
 fan:
   - platform: speed
@@ -437,3 +508,31 @@ climate:
       min_temperature: 30°C
       max_temperature: 70°C
       temperature_step: 0.5°C
+
+binary_sensor:
+  # Blindflug-Melder: ON = rack_max_temp hat keine Daten mehr (SNMP-Quelle tot).
+  # Genau dann greift der 50%-Failsafe. Über die API sieht Home Assistant das
+  # sofort -> von hier aus lässt sich eine Push-Notification auslösen (Teil b:
+  # "wir sagen es niemandem" ist damit erledigt).
+  - platform: template
+    name: "Kühlung Temperaturausfall"
+    id: cooling_temp_lost
+    device_class: problem
+    lambda: "return isnan(id(rack_max_temp).state);"
+
+interval:
+  # Failsafe-Watchdog. Läuft unabhängig vom PID (der bei NaN-Sensor evtl. gar
+  # nicht mehr schreibt). Solange die Temperaturquelle tot ist UND wir nicht im
+  # manuellen OFF-Modus sind: beide Lüfter auf festen 50%-Boden -- verhindert
+  # das Runter-Coasten, ohne Dauerlärm. Bei SNMP-Recovery hört das auf und der
+  # PID übernimmt beim nächsten Regelzyklus wieder.
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return isnan(id(rack_max_temp).state) &&
+                     id(rack_cooling).mode != climate::CLIMATE_MODE_OFF;
+          then:
+            - fan.turn_on: {id: fan1, speed: 50}
+            - fan.turn_on: {id: fan2, speed: 50}
